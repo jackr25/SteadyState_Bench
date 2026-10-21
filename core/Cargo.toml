@@ -1,0 +1,12 @@
+[package]
+name = "steady_state_bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "steady_state_cli"
+path = "main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+mini-redis = "0.4" 

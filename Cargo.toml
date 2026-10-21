@@ -1,6 +1,4 @@
-[package]
-name = "SteadyState_Bench"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["core", "src-tauri"]
+resolver = "2"
 
-[dependencies]
