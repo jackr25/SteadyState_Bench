@@ -9,6 +9,8 @@
 !Cargo.lock
 !Cargo.toml
 !.gitignore
+!.github/
+!.github/**
 
 !*.json
 !*.ts

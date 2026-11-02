@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SteadyState",
+  "mainBinaryName": "SteadyState",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.steadystate.bench",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -12,20 +13,23 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "SteadyState",
-        "width": 800,
-        "height": 600,
+        "width": 400,
+        "height": 560,
+        "minWidth": 300,
+        "minHeight": 380,
         "resizable": true,
         "fullscreen": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["appimage", "msi", "nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
