@@ -15,6 +15,16 @@ fn rescan(link: State<'_, Link>) {
 }
 
 #[tauri::command]
+fn pick_device(link: State<'_, Link>, port: String, driver: String) -> Result<(), String> {
+    link.pick(port, driver)
+}
+
+#[tauri::command]
+fn dismiss_choice(link: State<'_, Link>) {
+    link.dismiss();
+}
+
+#[tauri::command]
 async fn set_voltage(link: State<'_, Link>, volts: f64) -> Result<(), String> {
     link.with_psu(move |psu| psu.set_voltage(volts)).await
 }
@@ -47,6 +57,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             snapshot,
             rescan,
+            pick_device,
+            dismiss_choice,
             set_voltage,
             set_current,
             set_output
