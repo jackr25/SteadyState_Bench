@@ -164,6 +164,20 @@ impl Link {
     }
 }
 
+#[cfg(test)]
+impl Link {
+    /// A link with no worker behind it, in state `link`, holding `psu` if given. Commands
+    /// run against `psu` as usual; wake-ups go nowhere.
+    pub fn detached(psu: Option<Box<dyn Psu>>, link: LinkState) -> Self {
+        let (wake, _) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            psu: Mutex::new(psu),
+            snapshot: Mutex::new(Snapshot { link, status: None }),
+        });
+        Self { shared, wake }
+    }
+}
+
 /// What to do with the supplies a scan found.
 #[derive(Debug)]
 enum Choice {

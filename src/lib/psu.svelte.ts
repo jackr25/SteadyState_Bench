@@ -29,14 +29,25 @@ export type LinkState =
 
 type Snapshot = { link: LinkState; status: Status | null }
 
+/** The MCP server agents connect to (src-tauri/src/mcp.rs). */
+export type McpStatus =
+  | { kind: 'disabled' }
+  | { kind: 'listening'; url: string }
+  | { kind: 'failed'; error: string }
+
 const ERROR_MS = 5000
+const AGENT_NOTE_MS = 6000
 
 class Psu {
   link = $state<LinkState>({ kind: 'searching', last: null })
   status = $state<Status | null>(null)
   error = $state<string | null>(null)
+  /** The latest action an agent took over MCP, shown briefly in the footer. */
+  agentNote = $state<string | null>(null)
+  mcp = $state<McpStatus>({ kind: 'disabled' })
 
   #errorTimer: ReturnType<typeof setTimeout> | undefined
+  #agentTimer: ReturnType<typeof setTimeout> | undefined
 
   get connected() {
     return this.link.kind === 'connected'
@@ -60,6 +71,12 @@ class Psu {
       sawStatus = true
       this.status = e.payload
     })
+    await listen<string>('psu://agent', (e) => {
+      this.agentNote = e.payload
+      clearTimeout(this.#agentTimer)
+      this.#agentTimer = setTimeout(() => (this.agentNote = null), AGENT_NOTE_MS)
+    })
+    this.mcp = await invoke<McpStatus>('mcp_info')
     const snap = await invoke<Snapshot>('snapshot')
     if (!sawLink) this.link = snap.link
     if (!sawStatus) this.status = snap.status
