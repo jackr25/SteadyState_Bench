@@ -1,6 +1,7 @@
 <script lang="ts">
-  // "Agentic power configuration": whether agents connected over MCP may change setpoints
-  // and the output. Off at every launch; reading status is always allowed.
+  // "Agentic power configuration": whether agents connected over MCP get the tools that
+  // change voltage and current. Off at every launch. Reading status and switching the
+  // output are always available to agents.
   import { psu } from './psu.svelte'
 
   const on = $derived(psu.agentControl)
@@ -9,8 +10,8 @@
     psu.mcp.kind === 'failed'
       ? 'MCP server not running'
       : on
-        ? 'Agents can change setpoints and output'
-        : 'Agents can only read status',
+        ? 'Agents can also set voltage and current'
+        : 'Agents can read status and switch the output',
   )
 </script>
 

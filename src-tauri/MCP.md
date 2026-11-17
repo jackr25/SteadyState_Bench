@@ -12,15 +12,23 @@ blue while an agent is acting, and each action appears in the footer as it happe
 ## Allowing changes: "Agentic power configuration"
 
 The app has an **Agentic power configuration** switch below the Output button. It is **off
-every time the app starts**:
+every time the app starts**. It only governs voltage and current: seeing the supply and
+switching its output are always available, so an agent can power the device under test on,
+off or through a reset as part of a larger task.
 
-- **Off:** agents can call `get_status` and `rescan`; `set_voltage`, `set_current`, `apply`
-  and `set_output` are refused (the agent is told to ask you), and the footer shows
-  "Agent blocked: …".
-- **On:** agents can change setpoints and switch the output.
+| | Off | On |
+|---|---|---|
+| `get_status`, `rescan` | yes | yes |
+| `set_output`, `power_cycle` | yes | yes |
+| `set_voltage`, `set_current`, `apply` | not offered | yes |
+
+While off, the setpoint tools are left out of the tool list entirely. An agent that calls
+one anyway (from an older list) is refused and told to ask you, and the footer shows
+"Agent blocked: …". Flipping the switch sends connected agents `tools/list_changed`, so
+clients that support it update their tools straight away.
 
 Only you can flip it; there is no tool for it. `get_status` reports it as
-`agent_control_enabled`.
+`setpoint_tools_enabled`.
 
 ## Connecting an agent
 
@@ -55,19 +63,21 @@ bridge such as [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
 
 | Tool | What it does |
 |---|---|
-| `get_status` | Connection state, connected supply and its limits, live readings, whether changes are allowed. Read-only. |
-| `set_voltage` | Voltage setpoint (V). |
-| `set_current` | Current limit (A). |
-| `apply` | Voltage and current limit together; both are checked before either is sent. |
-| `set_output` | Output on/off. |
+| `get_status` | Connection state, connected supply and its limits, live readings, whether setpoint tools are on. Read-only. |
+| `set_output` | Output on/off, at the current setpoints. |
+| `power_cycle` | Output off for `off_seconds` (default 2, 0.1–60), then back on. Only while the output is on. |
 | `rescan` | Look for supplies again while disconnected. |
+| `set_voltage` | Voltage setpoint (V). Switch on only. |
+| `set_current` | Current limit (A). Switch on only. |
+| `apply` | Voltage and current limit together; both are checked before either is sent. Switch on only. |
 
 Results are structured JSON (with a text copy), and control tools return the updated status.
 Out-of-range values are refused as tool errors without touching the supply.
 
 ## What agents can't do
 
-- **Change anything while the switch is off** (see above), or flip the switch themselves.
+- **Change voltage or current while the switch is off** (see above), or flip the switch
+  themselves.
 - **Pick which supply to connect to.** When the app finds an unfamiliar supply, the person at
   the bench confirms it in the app; `get_status` reports `"choosing"` until they do.
 - **Reach it from another machine or a web page.** It listens on loopback only, accepts only

@@ -14,23 +14,32 @@
 //! refused, so web pages can't reach it. Agent CLIs don't send `Origin`.
 //!
 //! Choosing which supply to connect to stays with the person at the bench: tools work on
-//! the connected supply and report a pending choice, but can't answer it. Likewise the
-//! "Agentic power configuration" switch in the app ([`AgentControl`]): while it is off,
-//! agents can read status but every setpoint and output change is refused.
+//! the connected supply and report a pending choice, but can't answer it.
+//!
+//! The "Agentic power configuration" switch in the app ([`AgentControl`]) decides whether
+//! agents may change setpoints. While it is off, the setpoint tools ([`SETPOINT_TOOLS`])
+//! aren't offered at all; reading status and switching the output (on, off, power cycle)
+//! always are, so agents can fold power control into their other work. Flipping the switch
+//! sends connected agents `notifications/tools/list_changed`.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use psu_core::psu::{Limits, Psu, Status};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CacheScope, Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ResultType, ServerCapabilities, ServerConfig, Tool,
+};
+use rmcp::service::{NotificationContext, Peer, RequestContext};
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::link::{KnownDevice, Link, LinkState};
@@ -42,18 +51,44 @@ pub const PORT_ENV: &str = "STEADYSTATE_MCP_PORT";
 /// Announces an agent action to the person at the bench (the app shows it in the footer).
 pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
 
-/// The app's "Agentic power configuration" switch: whether agents may change setpoints and
-/// the output. Starts off each launch, so opening the app never hands an agent the bench.
+/// Tools offered only while the "Agentic power configuration" switch is on.
+pub const SETPOINT_TOOLS: [&str; 3] = ["set_voltage", "set_current", "apply"];
+
+/// The app's "Agentic power configuration" switch: whether agents get the setpoint tools.
+/// Starts off each launch, so opening the app never lets an agent change voltage or current.
 #[derive(Clone, Default)]
-pub struct AgentControl(Arc<AtomicBool>);
+pub struct AgentControl {
+    enabled: Arc<AtomicBool>,
+    /// Open MCP sessions, told when flipping the switch changes their tool list.
+    peers: Arc<Mutex<Vec<Peer<RoleServer>>>>,
+}
 
 impl AgentControl {
     pub fn enabled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.enabled.load(Ordering::SeqCst)
     }
 
+    /// Flips the switch and tells connected agents that their tool list changed.
     pub fn set(&self, on: bool) {
-        self.0.store(on, Ordering::SeqCst);
+        if self.enabled.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        peers.retain(|p| !p.is_transport_closed());
+        for peer in peers.iter() {
+            let peer = peer.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = peer.notify_tool_list_changed().await {
+                    log::debug!("tools/list_changed not delivered: {e}");
+                }
+            });
+        }
+    }
+
+    fn register(&self, peer: Peer<RoleServer>) {
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        peers.retain(|p| !p.is_transport_closed());
+        peers.push(peer);
     }
 }
 
@@ -120,12 +155,16 @@ max_amps) and live readings. Values outside the limits are rejected without touc
 supply. Setpoints are the voltage target and the current limit; the supply regulates to \
 whichever it hits first.
 
-Changing setpoints or the output needs the user's permission: the \"Agentic power \
-configuration\" switch in the app. While it is off (agent_control_enabled is false in \
-get_status), those tools are refused; ask the user to switch it on rather than retrying. \
-Even when it is on, only turn the output on when the user has asked for it, and set voltage and current limit \
-before enabling it (apply sets both at once). Readings take a moment to settle after a change; \
-call get_status again to see them.
+Switching the output (set_output, power_cycle) is always available, so you can power the \
+device under test on, off or through a reset as part of a larger task. Only switch the output \
+on when the user has asked for it.
+
+Changing voltage or current (set_voltage, set_current, apply) needs the user's permission: \
+the \"Agentic power configuration\" switch in the app. While it is off \
+(setpoint_tools_enabled is false in get_status) those tools aren't offered; if you need \
+different setpoints, ask the user to set them or to switch it on. The tool list updates \
+when they do. Readings take a moment to settle after a change; call get_status again to \
+see them.
 
 If connection is \"choosing\", the user has to pick a supply in the app window; tell them. \
 If it is \"disconnected\", rescan looks for supplies again.";
@@ -153,8 +192,9 @@ pub struct Report {
     /// Live readings, read from the supply for this call.
     pub readings: Option<Readings>,
     /// The app's "Agentic power configuration" switch. While false, set_voltage,
-    /// set_current, apply and set_output are refused; only the user can switch it on.
-    pub agent_control_enabled: bool,
+    /// set_current and apply aren't offered; only the user can switch it on. Switching the
+    /// output is always available.
+    pub setpoint_tools_enabled: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -261,7 +301,7 @@ impl Report {
             device,
             limits,
             readings: None,
-            agent_control_enabled: false,
+            setpoint_tools_enabled: false,
         }
     }
 }
@@ -285,6 +325,17 @@ pub struct OutputArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct PowerCycleArgs {
+    /// Seconds the output stays off, from 0.1 to 60. Default 2.
+    #[serde(default = "default_off_seconds")]
+    pub off_seconds: f64,
+}
+
+fn default_off_seconds() -> f64 {
+    2.0
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ApplyArgs {
     /// Voltage setpoint in volts, from 0 up to max_volts.
     pub volts: f64,
@@ -304,7 +355,7 @@ impl Bench {
     async fn report(&self) -> Report {
         let link = self.link.snapshot().link;
         let mut report = Report::from_link(&link);
-        report.agent_control_enabled = self.control.enabled();
+        report.setpoint_tools_enabled = self.control.enabled();
         if matches!(link, LinkState::Connected { .. }) {
             match self.link.with_psu(|psu| psu.status()).await {
                 Ok(status) => report.readings = Some(status.into()),
@@ -314,18 +365,33 @@ impl Bench {
         report
     }
 
-    /// Runs a device command, tells the person at the bench, and reports the result.
-    async fn act<F>(&self, what: String, f: F) -> ToolResult
+    /// Whether `tool` is offered right now.
+    fn offered(&self, tool: &str) -> bool {
+        self.control.enabled() || !SETPOINT_TOOLS.contains(&tool)
+    }
+
+    /// [`Self::act`] for setpoint changes. Those tools aren't listed while the switch is off,
+    /// but an agent may still call one from an older tool list, or race the switch.
+    async fn act_setpoint<F>(&self, what: String, f: F) -> ToolResult
     where
         F: FnOnce(&mut dyn Psu) -> psu_core::psu::Result<()> + Send + 'static,
     {
         if !self.control.enabled() {
             (self.notify)(format!("Agent blocked: {what}"));
             return Err(format!(
-                "{what} refused: \"Agentic power configuration\" is switched off in the \
-                 SteadyState app. Ask the user to switch it on; don't retry until they have."
+                "{what} refused: changing voltage and current needs \"Agentic power \
+                 configuration\" switched on in the SteadyState app. Ask the user to switch it \
+                 on or to set the values themselves. Output on/off is still available."
             ));
         }
+        self.act(what, f).await
+    }
+
+    /// Runs a device command, tells the person at the bench, and reports the result.
+    async fn act<F>(&self, what: String, f: F) -> ToolResult
+    where
+        F: FnOnce(&mut dyn Psu) -> psu_core::psu::Result<()> + Send + 'static,
+    {
         match self.link.with_psu(f).await {
             Ok(()) => {
                 (self.notify)(format!("Agent: {what}"));
@@ -358,7 +424,8 @@ impl Bench {
         )
     )]
     async fn set_voltage(&self, Parameters(VoltageArgs { volts }): Parameters<VoltageArgs>) -> ToolResult {
-        self.act(format!("set voltage to {volts} V"), move |psu| psu.set_voltage(volts)).await
+        self.act_setpoint(format!("set voltage to {volts} V"), move |psu| psu.set_voltage(volts))
+            .await
     }
 
     #[tool(
@@ -371,7 +438,10 @@ impl Bench {
         )
     )]
     async fn set_current(&self, Parameters(CurrentArgs { amps }): Parameters<CurrentArgs>) -> ToolResult {
-        self.act(format!("set current limit to {amps} A"), move |psu| psu.set_current(amps)).await
+        self.act_setpoint(format!("set current limit to {amps} A"), move |psu| {
+            psu.set_current(amps)
+        })
+        .await
     }
 
     #[tool(
@@ -387,12 +457,14 @@ impl Bench {
         )
     )]
     async fn apply(&self, Parameters(ApplyArgs { volts, amps }): Parameters<ApplyArgs>) -> ToolResult {
-        self.act(format!("set {volts} V, {amps} A"), move |psu| psu.apply(volts, amps)).await
+        self.act_setpoint(format!("set {volts} V, {amps} A"), move |psu| psu.apply(volts, amps))
+            .await
     }
 
     #[tool(
-        description = "Switch the output terminals on or off. Only switch on when the user asked \
-                       for it, after setting voltage and current limit. Returns the updated status.",
+        description = "Switch the output terminals on or off, e.g. to power the device under \
+                       test for a step of a larger task. Uses the setpoints shown by get_status. \
+                       Only switch on when the user asked for it. Returns the updated status.",
         annotations(
             title = "Switch output",
             destructive_hint = true,
@@ -403,6 +475,35 @@ impl Bench {
     async fn set_output(&self, Parameters(OutputArgs { on }): Parameters<OutputArgs>) -> ToolResult {
         let what = if on { "output on" } else { "output off" };
         self.act(what.to_string(), move |psu| psu.set_output(on)).await
+    }
+
+    #[tool(
+        description = "Switch the output off, wait, and switch it back on, e.g. to reset the \
+                       device under test. Only works while the output is on, and leaves it on. \
+                       Blocks for off_seconds. Returns the updated status.",
+        annotations(title = "Power cycle output", destructive_hint = true, open_world_hint = false)
+    )]
+    async fn power_cycle(
+        &self,
+        Parameters(PowerCycleArgs { off_seconds }): Parameters<PowerCycleArgs>,
+    ) -> ToolResult {
+        if !(0.1..=60.0).contains(&off_seconds) {
+            return Err(format!("off_seconds must be between 0.1 and 60, got {off_seconds}"));
+        }
+        let on = self.link.with_psu(|psu| psu.status()).await.map(|s| s.output_on);
+        match on {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err("the output is off; switch it on with set_output instead".into());
+            }
+            Err(e) => return Err(format!("power cycle failed: {e}")),
+        }
+        self.act(format!("power cycle: output off for {off_seconds} s"), |psu| {
+            psu.set_output(false)
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_secs_f64(off_seconds)).await;
+        self.act("power cycle: output on".into(), |psu| psu.set_output(true)).await
     }
 
     #[tool(
@@ -420,22 +521,52 @@ impl Bench {
     }
 }
 
+/// `call_tool` comes from the macro; listing is filtered by the switch.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Bench {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let capabilities =
+            ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build();
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("steadystate", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        tools.retain(|t| self.offered(&t.name));
+        // The list depends on the switch, so it must not be cached.
+        let hints = context.protocol_version().is_some_and(|v| v >= ProtocolVersion::V_2026_07_28);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: hints.then_some(0),
+            cache_scope: hints.then_some(CacheScope::Private),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).filter(|t| self.offered(&t.name)).cloned()
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.control.register(context.peer);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     use psu_core::psu::{DeviceInfo, Error, check_range};
-    use rmcp::ServiceExt;
+    use rmcp::{ClientHandler, RoleClient, ServiceExt};
     use rmcp::model::{CallToolRequestParams, CallToolResult};
     use rmcp::service::RunningService;
     use rmcp::transport::StreamableHttpClientTransport;
@@ -513,7 +644,26 @@ mod tests {
         url: String,
         notes: Arc<Mutex<Vec<String>>>,
         control: AgentControl,
-        client: RunningService<rmcp::RoleClient, ()>,
+        client: RunningService<RoleClient, TestClient>,
+    }
+
+    /// Counts `notifications/tools/list_changed`.
+    #[derive(Clone, Default)]
+    struct TestClient {
+        list_changed: Arc<AtomicUsize>,
+    }
+
+    impl ClientHandler for TestClient {
+        async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+            self.list_changed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn tool_names(h: &Harness) -> Vec<String> {
+        let mut names: Vec<_> =
+            h.client.list_all_tools().await.unwrap().iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        names
     }
 
     /// Serves `link` with agent control switched on.
@@ -532,7 +682,8 @@ mod tests {
         let notify: Notify = Arc::new(move |n| sink.lock().unwrap().push(n));
         let control = AgentControl::default();
         tokio::spawn(serve(listener, link, notify, control.clone()));
-        let client = ().serve(StreamableHttpClientTransport::from_uri(url.clone())).await.unwrap();
+        let transport = StreamableHttpClientTransport::from_uri(url.clone());
+        let client = TestClient::default().serve(transport).await.unwrap();
         Harness { url, notes, control, client }
     }
 
@@ -561,10 +712,12 @@ mod tests {
         assert_eq!(info.server_info.as_ref().unwrap().name, "steadystate");
         assert!(info.instructions.as_deref().unwrap().contains("get_status"));
 
+        assert!(info.capabilities.tools.as_ref().unwrap().list_changed == Some(true));
+        assert_eq!(
+            tool_names(&h).await,
+            ["apply", "get_status", "power_cycle", "rescan", "set_current", "set_output", "set_voltage"]
+        );
         let tools = h.client.list_all_tools().await.unwrap();
-        let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
-        names.sort();
-        assert_eq!(names, ["apply", "get_status", "rescan", "set_current", "set_output", "set_voltage"]);
         let get_status = tools.iter().find(|t| t.name == "get_status").unwrap();
         assert_eq!(get_status.annotations.as_ref().unwrap().read_only_hint, Some(true));
         assert!(get_status.output_schema.is_some());
@@ -643,35 +796,96 @@ mod tests {
         assert!(detail.contains("Fake 30 V / 5 A on COM9") && detail.contains("SteadyState window"));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn switch_off_blocks_changes_but_not_reading() {
-        let h = start_locked(Link::detached(Some(FakePsu::boxed()), connected())).await;
-        let s = call(&h, "get_status", json!({})).await;
-        assert_eq!(structured(&s)["agent_control_enabled"], false);
-        assert_eq!(structured(&s)["readings"]["set_volts"], 5.0);
+    const ALWAYS: [&str; 4] = ["get_status", "power_cycle", "rescan", "set_output"];
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switch_off_hides_setpoint_tools_but_keeps_power_switching() {
+        let h = start_locked(Link::detached(Some(FakePsu::boxed()), connected())).await;
+        assert_eq!(tool_names(&h).await, ALWAYS);
+
+        // The agent can still see the supply...
+        let s = call(&h, "get_status", json!({})).await;
+        assert_eq!(structured(&s)["connection"], "connected");
+        assert_eq!(structured(&s)["device"]["model"], "Fake 30 V / 5 A");
+        assert_eq!(structured(&s)["setpoint_tools_enabled"], false);
+        // ...and switch its output.
+        let r = call(&h, "set_output", json!({ "on": true })).await;
+        assert_eq!(structured(&r)["readings"]["output_on"], true);
+        let r = call(&h, "set_output", json!({ "on": false })).await;
+        assert_eq!(structured(&r)["readings"]["output_on"], false);
+
+        // Setpoint tools called anyway (stale list) are refused and change nothing.
         for (tool, args) in [
             ("set_voltage", json!({ "volts": 12.0 })),
             ("set_current", json!({ "amps": 1.0 })),
             ("apply", json!({ "volts": 12.0, "amps": 1.0 })),
-            ("set_output", json!({ "on": true })),
         ] {
             let err = error_text(&call(&h, tool, args).await);
             assert!(err.contains("Agentic power configuration"), "{tool}: {err}");
         }
         let s = call(&h, "get_status", json!({})).await;
         assert_eq!(structured(&s)["readings"]["set_volts"], 5.0);
-        assert_eq!(structured(&s)["readings"]["output_on"], false);
-        assert_eq!(h.notes.lock().unwrap().len(), 4);
-        assert_eq!(h.notes.lock().unwrap()[3], "Agent blocked: output on");
+        assert_eq!(structured(&s)["readings"]["set_amps"], 1.0);
+        assert_eq!(
+            *h.notes.lock().unwrap(),
+            [
+                "Agent: output on",
+                "Agent: output off",
+                "Agent blocked: set voltage to 12 V",
+                "Agent blocked: set current limit to 1 A",
+                "Agent blocked: set 12 V, 1 A",
+            ]
+        );
+    }
 
-        // Switching it on in the app takes effect for the open session.
+    async fn wait_for_list_changed(h: &Harness, count: usize) {
+        for _ in 0..200 {
+            if h.client.service().list_changed.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no tools/list_changed #{count}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flipping_the_switch_updates_open_sessions() {
+        let h = start_locked(Link::detached(Some(FakePsu::boxed()), connected())).await;
+        assert_eq!(tool_names(&h).await, ALWAYS);
+
         h.control.set(true);
+        wait_for_list_changed(&h, 1).await;
+        assert_eq!(tool_names(&h).await.len(), 7);
         let r = call(&h, "set_voltage", json!({ "volts": 12.0 })).await;
         assert_eq!(structured(&r)["readings"]["set_volts"], 12.0);
-        assert_eq!(structured(&r)["agent_control_enabled"], true);
+        assert_eq!(structured(&r)["setpoint_tools_enabled"], true);
+
+        // Setting it to what it already is sends nothing.
+        h.control.set(true);
         h.control.set(false);
-        assert!(error_text(&call(&h, "set_output", json!({ "on": true })).await).contains("switched off"));
+        wait_for_list_changed(&h, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(h.client.service().list_changed.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_names(&h).await, ALWAYS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn power_cycle_turns_off_then_on() {
+        let h = start_locked(Link::detached(Some(FakePsu::boxed()), connected())).await;
+        let err = error_text(&call(&h, "power_cycle", json!({ "off_seconds": 0.1 })).await);
+        assert!(err.contains("output is off"), "{err}");
+        assert!(error_text(&call(&h, "power_cycle", json!({ "off_seconds": 0.0 })).await)
+            .contains("between 0.1 and 60"));
+
+        call(&h, "set_output", json!({ "on": true })).await;
+        let started = std::time::Instant::now();
+        let r = call(&h, "power_cycle", json!({ "off_seconds": 0.2 })).await;
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(structured(&r)["readings"]["output_on"], true);
+        assert_eq!(
+            h.notes.lock().unwrap()[1..],
+            ["Agent: power cycle: output off for 0.2 s", "Agent: power cycle: output on"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

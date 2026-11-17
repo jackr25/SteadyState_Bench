@@ -27,7 +27,7 @@ tauri-plugin-log = "2"
 # MCP server for agents (src/mcp.rs): Streamable HTTP on loopback.
 rmcp = { version = "3.11.0", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["net", "time"] }
 
 [dev-dependencies]
 rmcp = { version = "3.11.0", features = ["client", "transport-streamable-http-client-reqwest"] }
