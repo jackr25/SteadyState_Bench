@@ -2,10 +2,10 @@
 //! after the link drops. A worker thread does all of it and reports through events; Tauri
 //! commands borrow the open device through [`Link::with_psu`].
 //!
-//! Background retries are deliberately narrow. Probing writes a Modbus frame to whatever is
-//! on the port, and merely opening some ports resets the device behind them (Arduino DTR),
-//! so while disconnected we only retry the last-known port and probe ports that newly
-//! appeared. A full scan happens at startup and when the user asks for one.
+//! Background retries are deliberately narrow. Probing writes to whatever is on the port (a
+//! Modbus frame, a `*IDN?`), and merely opening some ports resets the device behind them
+//! (Arduino DTR), so while disconnected we only retry the last-known port and probe ports
+//! that newly appeared. A full scan happens at startup and when the user asks for one.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

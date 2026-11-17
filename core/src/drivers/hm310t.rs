@@ -85,6 +85,9 @@ pub mod reg {
 pub const BAUD_RATE: u32 = 9600;
 pub const DEFAULT_SLAVE: u8 = 1;
 
+/// USB vendor id of the built-in CH340 serial bridge (WCH).
+pub const CH340_VID: u16 = 0x1A86;
+
 /// Spec values sharing this map and 0x0233 scaling: 3010 (30 V/10 A, per hm310t project)
 /// and 3210 (32 V/10 A, our bench unit).
 pub const KNOWN_SPECS: [u16; 2] = [3010, 3210];
@@ -97,6 +100,7 @@ const PROTECTION_HEADROOM: f64 = 1.2;
 pub const DRIVER: Driver = Driver {
     id: "hanmatek-hm310t",
     name: "Hanmatek HM310T (Modbus RTU)",
+    usb_vids: &[CH340_VID],
     open: open_port,
 };
 

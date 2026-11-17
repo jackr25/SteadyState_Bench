@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use steady_state_bench::drivers::{self, DRIVERS, Driver, hm310t};
+use steady_state_bench::drivers::{self, DRIVERS, Driver, hm310t, korad};
 use steady_state_bench::presets::{Preset, PresetStore};
 use steady_state_bench::psu::Psu;
 use steady_state_bench::serial;
@@ -64,6 +64,8 @@ enum Cmd {
         #[arg(default_value_t = 1)]
         count: u16,
     },
+    /// Send a query (must end in '?', e.g. STATUS?) to a Korad and print the raw reply
+    RawQuery { query: String },
 }
 
 #[derive(Subcommand)]
@@ -188,6 +190,17 @@ fn run(cli: Cli) -> CliResult {
             for (i, v) in psu.raw_read(start, count)?.iter().enumerate() {
                 println!("{:#06x}: {v:#06x} ({v})", usize::from(start) + i);
             }
+        }
+        Cmd::RawQuery { query } => {
+            let port = target.resolve_port(&[&korad::DRIVER])?;
+            let mut psu = korad::connect(&port)?;
+            let reply = psu.raw_query(&query)?;
+            let text: String = reply
+                .iter()
+                .map(|&b| if (0x20..0x7F).contains(&b) { char::from(b) } else { '.' })
+                .collect();
+            let hex: Vec<String> = reply.iter().map(|b| format!("{b:02X}")).collect();
+            println!("{text:?}  [{}]", hex.join(" "));
         }
         cmd => {
             let mut psu = target.connect()?;
