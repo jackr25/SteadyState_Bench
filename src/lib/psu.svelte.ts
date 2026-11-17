@@ -45,6 +45,8 @@ class Psu {
   /** The latest action an agent took over MCP, shown briefly in the footer. */
   agentNote = $state<string | null>(null)
   mcp = $state<McpStatus>({ kind: 'disabled' })
+  /** "Agentic power configuration": may agents change setpoints and the output? */
+  agentControl = $state(false)
 
   #errorTimer: ReturnType<typeof setTimeout> | undefined
   #agentTimer: ReturnType<typeof setTimeout> | undefined
@@ -77,6 +79,7 @@ class Psu {
       this.#agentTimer = setTimeout(() => (this.agentNote = null), AGENT_NOTE_MS)
     })
     this.mcp = await invoke<McpStatus>('mcp_info')
+    this.agentControl = await invoke<boolean>('agent_control')
     const snap = await invoke<Snapshot>('snapshot')
     if (!sawLink) this.link = snap.link
     if (!sawStatus) this.status = snap.status
@@ -89,16 +92,28 @@ class Psu {
   pick = (d: Detected) => this.#run('pick_device', { port: d.port, driver: d.info.driver })
   dismissChoice = () => this.#run('dismiss_choice')
 
+  async setAgentControl(on: boolean) {
+    try {
+      this.agentControl = await invoke<boolean>('set_agent_control', { on })
+    } catch (e) {
+      this.#fail(e)
+    }
+  }
+
   async #run(cmd: string, args?: Record<string, unknown>): Promise<boolean> {
     try {
       await invoke(cmd, args)
       return true
     } catch (e) {
-      this.error = String(e)
-      clearTimeout(this.#errorTimer)
-      this.#errorTimer = setTimeout(() => (this.error = null), ERROR_MS)
+      this.#fail(e)
       return false
     }
+  }
+
+  #fail(e: unknown) {
+    this.error = String(e)
+    clearTimeout(this.#errorTimer)
+    this.#errorTimer = setTimeout(() => (this.error = null), ERROR_MS)
   }
 }
 

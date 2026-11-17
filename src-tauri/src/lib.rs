@@ -5,7 +5,7 @@ mod persist;
 use std::sync::Arc;
 
 use link::{Link, Snapshot};
-use mcp::McpStatus;
+use mcp::{AgentControl, McpStatus};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Agent actions, shown in the footer so the person at the bench sees them.
@@ -19,6 +19,19 @@ fn snapshot(link: State<'_, Link>) -> Snapshot {
 #[tauri::command]
 fn mcp_info(status: State<'_, McpStatus>) -> McpStatus {
     status.inner().clone()
+}
+
+#[tauri::command]
+fn agent_control(control: State<'_, AgentControl>) -> bool {
+    control.enabled()
+}
+
+/// The "Agentic power configuration" switch.
+#[tauri::command]
+fn set_agent_control(control: State<'_, AgentControl>, on: bool) -> bool {
+    control.set(on);
+    log::info!("agentic power configuration {}", if on { "on" } else { "off" });
+    on
 }
 
 #[tauri::command]
@@ -64,13 +77,17 @@ pub fn run() {
             }
             let last_device = app.path().app_config_dir()?.join("last_device.json");
             let link = Link::start(app.handle().clone(), last_device);
-            app.manage(start_mcp(app.handle(), link.clone()));
+            let control = AgentControl::default();
+            app.manage(start_mcp(app.handle(), link.clone(), control.clone()));
+            app.manage(control);
             app.manage(link);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
             mcp_info,
+            agent_control,
+            set_agent_control,
             rescan,
             pick_device,
             dismiss_choice,
@@ -83,7 +100,7 @@ pub fn run() {
 }
 
 /// Starts the MCP server for agents unless disabled; never fails app startup.
-fn start_mcp(app: &AppHandle, link: Link) -> McpStatus {
+fn start_mcp(app: &AppHandle, link: Link, control: AgentControl) -> McpStatus {
     let port = match mcp::port_from_env() {
         None => return McpStatus::Disabled,
         Some(Err(error)) => return McpStatus::Failed { error },
@@ -107,7 +124,7 @@ fn start_mcp(app: &AppHandle, link: Link) -> McpStatus {
         let _ = emitter.emit(EVENT_AGENT, note);
     });
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = mcp::serve(listener, link, notify).await {
+        if let Err(e) = mcp::serve(listener, link, notify, control).await {
             log::error!("MCP server stopped: {e}");
         }
     });

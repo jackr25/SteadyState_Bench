@@ -14,11 +14,14 @@
 //! refused, so web pages can't reach it. Agent CLIs don't send `Origin`.
 //!
 //! Choosing which supply to connect to stays with the person at the bench: tools work on
-//! the connected supply and report a pending choice, but can't answer it.
+//! the connected supply and report a pending choice, but can't answer it. Likewise the
+//! "Agentic power configuration" switch in the app ([`AgentControl`]): while it is off,
+//! agents can read status but every setpoint and output change is refused.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use psu_core::psu::{Limits, Psu, Status};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -38,6 +41,21 @@ pub const PORT_ENV: &str = "STEADYSTATE_MCP_PORT";
 
 /// Announces an agent action to the person at the bench (the app shows it in the footer).
 pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
+
+/// The app's "Agentic power configuration" switch: whether agents may change setpoints and
+/// the output. Starts off each launch, so opening the app never hands an agent the bench.
+#[derive(Clone, Default)]
+pub struct AgentControl(Arc<AtomicBool>);
+
+impl AgentControl {
+    pub fn enabled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub fn set(&self, on: bool) {
+        self.0.store(on, Ordering::SeqCst);
+    }
+}
 
 /// Whether and where the server listens, for the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -76,10 +94,15 @@ pub fn url(addr: SocketAddr) -> String {
 }
 
 /// Serves MCP on `listener` until the process exits. Must run inside a Tokio runtime.
-pub async fn serve(listener: std::net::TcpListener, link: Link, notify: Notify) -> io::Result<()> {
+pub async fn serve(
+    listener: std::net::TcpListener,
+    link: Link,
+    notify: Notify,
+    control: AgentControl,
+) -> io::Result<()> {
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let service = StreamableHttpService::new(
-        move || Ok(Bench::new(link.clone(), notify.clone())),
+        move || Ok(Bench::new(link.clone(), notify.clone(), control.clone())),
         LocalSessionManager::default().into(),
         // Default allowed hosts are the loopback names; additionally refuse every request
         // that carries a browser Origin.
@@ -97,7 +120,10 @@ max_amps) and live readings. Values outside the limits are rejected without touc
 supply. Setpoints are the voltage target and the current limit; the supply regulates to \
 whichever it hits first.
 
-Only turn the output on when the user has asked for it, and set voltage and current limit \
+Changing setpoints or the output needs the user's permission: the \"Agentic power \
+configuration\" switch in the app. While it is off (agent_control_enabled is false in \
+get_status), those tools are refused; ask the user to switch it on rather than retrying. \
+Even when it is on, only turn the output on when the user has asked for it, and set voltage and current limit \
 before enabling it (apply sets both at once). Readings take a moment to settle after a change; \
 call get_status again to see them.
 
@@ -109,6 +135,7 @@ If it is \"disconnected\", rescan looks for supplies again.";
 pub struct Bench {
     link: Link,
     notify: Notify,
+    control: AgentControl,
     tool_router: ToolRouter<Self>,
 }
 
@@ -125,6 +152,9 @@ pub struct Report {
     pub limits: Option<DeviceLimits>,
     /// Live readings, read from the supply for this call.
     pub readings: Option<Readings>,
+    /// The app's "Agentic power configuration" switch. While false, set_voltage,
+    /// set_current, apply and set_output are refused; only the user can switch it on.
+    pub agent_control_enabled: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -225,7 +255,14 @@ impl Report {
                 None,
             ),
         };
-        Self { connection: connection.into(), detail, device, limits, readings: None }
+        Self {
+            connection: connection.into(),
+            detail,
+            device,
+            limits,
+            readings: None,
+            agent_control_enabled: false,
+        }
     }
 }
 
@@ -259,14 +296,15 @@ type ToolResult = Result<Json<Report>, String>;
 
 #[tool_router]
 impl Bench {
-    pub fn new(link: Link, notify: Notify) -> Self {
-        Self { link, notify, tool_router: Self::tool_router() }
+    pub fn new(link: Link, notify: Notify, control: AgentControl) -> Self {
+        Self { link, notify, control, tool_router: Self::tool_router() }
     }
 
     /// Connection state plus, when connected, live readings straight from the supply.
     async fn report(&self) -> Report {
         let link = self.link.snapshot().link;
         let mut report = Report::from_link(&link);
+        report.agent_control_enabled = self.control.enabled();
         if matches!(link, LinkState::Connected { .. }) {
             match self.link.with_psu(|psu| psu.status()).await {
                 Ok(status) => report.readings = Some(status.into()),
@@ -281,6 +319,13 @@ impl Bench {
     where
         F: FnOnce(&mut dyn Psu) -> psu_core::psu::Result<()> + Send + 'static,
     {
+        if !self.control.enabled() {
+            (self.notify)(format!("Agent blocked: {what}"));
+            return Err(format!(
+                "{what} refused: \"Agentic power configuration\" is switched off in the \
+                 SteadyState app. Ask the user to switch it on; don't retry until they have."
+            ));
+        }
         match self.link.with_psu(f).await {
             Ok(()) => {
                 (self.notify)(format!("Agent: {what}"));
@@ -467,18 +512,28 @@ mod tests {
     struct Harness {
         url: String,
         notes: Arc<Mutex<Vec<String>>>,
+        control: AgentControl,
         client: RunningService<rmcp::RoleClient, ()>,
     }
 
+    /// Serves `link` with agent control switched on.
     async fn start(link: Link) -> Harness {
+        let h = start_locked(link).await;
+        h.control.set(true);
+        h
+    }
+
+    /// Serves `link` with agent control in its startup state (off).
+    async fn start_locked(link: Link) -> Harness {
         let listener = bind(0).unwrap();
         let url = url(listener.local_addr().unwrap());
         let notes = Arc::new(Mutex::new(Vec::new()));
         let sink = notes.clone();
         let notify: Notify = Arc::new(move |n| sink.lock().unwrap().push(n));
-        tokio::spawn(serve(listener, link, notify));
+        let control = AgentControl::default();
+        tokio::spawn(serve(listener, link, notify, control.clone()));
         let client = ().serve(StreamableHttpClientTransport::from_uri(url.clone())).await.unwrap();
-        Harness { url, notes, client }
+        Harness { url, notes, control, client }
     }
 
     async fn call(h: &Harness, tool: &'static str, args: Value) -> CallToolResult {
@@ -586,6 +641,37 @@ mod tests {
         assert_eq!(structured(&s)["connection"], "choosing");
         let detail = structured(&s)["detail"].as_str().unwrap().to_string();
         assert!(detail.contains("Fake 30 V / 5 A on COM9") && detail.contains("SteadyState window"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switch_off_blocks_changes_but_not_reading() {
+        let h = start_locked(Link::detached(Some(FakePsu::boxed()), connected())).await;
+        let s = call(&h, "get_status", json!({})).await;
+        assert_eq!(structured(&s)["agent_control_enabled"], false);
+        assert_eq!(structured(&s)["readings"]["set_volts"], 5.0);
+
+        for (tool, args) in [
+            ("set_voltage", json!({ "volts": 12.0 })),
+            ("set_current", json!({ "amps": 1.0 })),
+            ("apply", json!({ "volts": 12.0, "amps": 1.0 })),
+            ("set_output", json!({ "on": true })),
+        ] {
+            let err = error_text(&call(&h, tool, args).await);
+            assert!(err.contains("Agentic power configuration"), "{tool}: {err}");
+        }
+        let s = call(&h, "get_status", json!({})).await;
+        assert_eq!(structured(&s)["readings"]["set_volts"], 5.0);
+        assert_eq!(structured(&s)["readings"]["output_on"], false);
+        assert_eq!(h.notes.lock().unwrap().len(), 4);
+        assert_eq!(h.notes.lock().unwrap()[3], "Agent blocked: output on");
+
+        // Switching it on in the app takes effect for the open session.
+        h.control.set(true);
+        let r = call(&h, "set_voltage", json!({ "volts": 12.0 })).await;
+        assert_eq!(structured(&r)["readings"]["set_volts"], 12.0);
+        assert_eq!(structured(&r)["agent_control_enabled"], true);
+        h.control.set(false);
+        assert!(error_text(&call(&h, "set_output", json!({ "on": true })).await).contains("switched off"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

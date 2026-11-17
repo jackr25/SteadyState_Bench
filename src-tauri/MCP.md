@@ -9,6 +9,19 @@ http://127.0.0.1:47310/mcp
 The **MCP** badge in the app's footer shows the address; click it to copy. The badge turns
 blue while an agent is acting, and each action appears in the footer as it happens.
 
+## Allowing changes: "Agentic power configuration"
+
+The app has an **Agentic power configuration** switch below the Output button. It is **off
+every time the app starts**:
+
+- **Off:** agents can call `get_status` and `rescan`; `set_voltage`, `set_current`, `apply`
+  and `set_output` are refused (the agent is told to ask you), and the footer shows
+  "Agent blocked: …".
+- **On:** agents can change setpoints and switch the output.
+
+Only you can flip it; there is no tool for it. `get_status` reports it as
+`agent_control_enabled`.
+
 ## Connecting an agent
 
 **Claude Code**
@@ -42,7 +55,7 @@ bridge such as [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
 
 | Tool | What it does |
 |---|---|
-| `get_status` | Connection state, connected supply and its limits, live readings. Read-only. |
+| `get_status` | Connection state, connected supply and its limits, live readings, whether changes are allowed. Read-only. |
 | `set_voltage` | Voltage setpoint (V). |
 | `set_current` | Current limit (A). |
 | `apply` | Voltage and current limit together; both are checked before either is sent. |
@@ -54,6 +67,7 @@ Out-of-range values are refused as tool errors without touching the supply.
 
 ## What agents can't do
 
+- **Change anything while the switch is off** (see above), or flip the switch themselves.
 - **Pick which supply to connect to.** When the app finds an unfamiliar supply, the person at
   the bench confirms it in the app; `get_status` reports `"choosing"` until they do.
 - **Reach it from another machine or a web page.** It listens on loopback only, accepts only
