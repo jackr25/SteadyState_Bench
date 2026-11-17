@@ -8,10 +8,12 @@
 //!
 //! Setup for agents: `src-tauri/MCP.md`.
 //!
-//! Transport: Streamable HTTP at `http://127.0.0.1:<port>/mcp` ([`DEFAULT_PORT`], override
-//! or disable with [`PORT_ENV`]). Bound to loopback only; the `Host` header must be a
-//! loopback name (DNS-rebinding guard) and any request carrying a browser `Origin` is
-//! refused, so web pages can't reach it. Agent CLIs don't send `Origin`.
+//! Transport: Streamable HTTP at `http://127.0.0.1:<port>/mcp`. The port is set in the app's
+//! MCP Settings (default [`DEFAULT_PORT`]) and [`McpServer`] moves to a new one immediately.
+//! The host is deliberately not configurable: bound to loopback only, the `Host` header must
+//! be a loopback name (DNS-rebinding guard), and any request carrying a browser `Origin` is
+//! refused, so neither other machines nor web pages can reach it. Agent CLIs don't send
+//! `Origin`.
 //!
 //! Choosing which supply to connect to stays with the person at the bench: tools work on
 //! the connected supply and report a pending choice, but can't answer it.
@@ -41,12 +43,11 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::link::{KnownDevice, Link, LinkState};
 
 pub const DEFAULT_PORT: u16 = 47310;
-/// Port override; `off` disables the server.
-pub const PORT_ENV: &str = "STEADYSTATE_MCP_PORT";
 
 /// Announces an agent action to the person at the bench (the app shows it in the footer).
 pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
@@ -92,32 +93,17 @@ impl AgentControl {
     }
 }
 
-/// Whether and where the server listens, for the frontend.
-#[derive(Debug, Clone, Serialize)]
+/// Whether and where the server listens, for the frontend. `port` is the configured port,
+/// also when listening on it failed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum McpStatus {
-    Disabled,
-    Listening { url: String },
-    Failed { error: String },
+    Listening { url: String, port: u16 },
+    Failed { error: String, port: u16 },
 }
 
-/// Reads [`PORT_ENV`]: `None` = disabled, `Some(Err)` = unusable value.
-pub fn port_from_env() -> Option<Result<u16, String>> {
-    match std::env::var(PORT_ENV) {
-        Err(_) => Some(Ok(DEFAULT_PORT)),
-        Ok(v) if v.trim().eq_ignore_ascii_case("off") => None,
-        Ok(v) => Some(
-            v.trim()
-                .parse::<u16>()
-                .ok()
-                .filter(|&p| p != 0)
-                .ok_or(format!("{PORT_ENV}={v:?} is not a port number or \"off\"")),
-        ),
-    }
-}
-
-/// Binds the loopback listener. Done synchronously at startup so the app knows right away
-/// whether the server is up (e.g. a second instance finds the port taken).
+/// Binds the loopback listener. Done synchronously so the caller knows right away whether
+/// the port is usable (e.g. a second instance finds it taken).
 pub fn bind(port: u16) -> io::Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
     listener.set_nonblocking(true)?;
@@ -128,12 +114,14 @@ pub fn url(addr: SocketAddr) -> String {
     format!("http://{addr}/mcp")
 }
 
-/// Serves MCP on `listener` until the process exits. Must run inside a Tokio runtime.
+/// Serves MCP on `listener` until `stop` is cancelled, which also ends open sessions and
+/// their event streams. Must run inside a Tokio runtime.
 pub async fn serve(
     listener: std::net::TcpListener,
     link: Link,
     notify: Notify,
     control: AgentControl,
+    stop: CancellationToken,
 ) -> io::Result<()> {
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let service = StreamableHttpService::new(
@@ -141,9 +129,82 @@ pub async fn serve(
         LocalSessionManager::default().into(),
         // Default allowed hosts are the loopback names; additionally refuse every request
         // that carries a browser Origin.
-        StreamableHttpServerConfig::default().enforce_origin_validation(),
+        StreamableHttpServerConfig::default()
+            .enforce_origin_validation()
+            .with_cancellation_token(stop.child_token()),
     );
-    axum::serve(listener, axum::Router::new().nest_service("/mcp", service)).await
+    axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+        .with_graceful_shutdown(stop.cancelled_owned())
+        .await
+}
+
+/// The running MCP server, movable to another port while the app runs.
+pub struct McpServer {
+    link: Link,
+    notify: Notify,
+    control: AgentControl,
+    state: Mutex<Running>,
+}
+
+struct Running {
+    status: McpStatus,
+    /// Stops the current server; `None` while not listening.
+    stop: Option<CancellationToken>,
+}
+
+impl McpServer {
+    /// Starts serving on `port`. Never fails: a port that can't be used is reported through
+    /// [`Self::status`], and the user can pick another.
+    pub fn start(link: Link, notify: Notify, control: AgentControl, port: u16) -> Self {
+        let error = "not started".to_string();
+        let state = Mutex::new(Running { status: McpStatus::Failed { error, port }, stop: None });
+        let server = Self { link, notify, control, state };
+        if let Err(error) = server.set_port(port) {
+            log::warn!("MCP server not started: {error}");
+            server.lock().status = McpStatus::Failed { error, port };
+        }
+        server
+    }
+
+    pub fn status(&self) -> McpStatus {
+        self.lock().status.clone()
+    }
+
+    /// Moves the server to `port`. The new port is bound before the old server stops, so if
+    /// it can't be used the current server keeps running and the error is returned. Open
+    /// sessions on the old port end; agents reconnect at the new address.
+    pub fn set_port(&self, port: u16) -> Result<McpStatus, String> {
+        let mut running = self.lock();
+        if matches!(running.status, McpStatus::Listening { port: p, .. } if p == port) {
+            return Ok(running.status.clone());
+        }
+        if port == 0 {
+            return Err("port must be between 1 and 65535".into());
+        }
+        let listener =
+            bind(port).map_err(|e| format!("can't listen on 127.0.0.1:{port}: {e}"))?;
+        let url = url(listener.local_addr().map_err(|e| e.to_string())?);
+
+        if let Some(old) = running.stop.take() {
+            old.cancel();
+        }
+        let stop = CancellationToken::new();
+        let (link, notify, control) = (self.link.clone(), self.notify.clone(), self.control.clone());
+        let token = stop.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = serve(listener, link, notify, control, token).await {
+                log::error!("MCP server on port {port} stopped: {e}");
+            }
+        });
+        log::info!("MCP server listening at {url}");
+        running.status = McpStatus::Listening { url, port };
+        running.stop = Some(stop);
+        Ok(running.status.clone())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Running> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 const INSTRUCTIONS: &str = "\
@@ -160,9 +221,10 @@ device under test on, off or through a reset as part of a larger task. Only swit
 on when the user has asked for it.
 
 Changing voltage or current (set_voltage, set_current, apply) needs the user's permission: \
-the \"Agentic power configuration\" switch in the app. While it is off \
-(setpoint_tools_enabled is false in get_status) those tools aren't offered; if you need \
-different setpoints, ask the user to set them or to switch it on. The tool list updates \
+the switch under \"MCP Settings\" in the app, which reads \"Output On/Off Controls Only\" \
+when off and \"Full Agent Controls\" when on. While it is off (setpoint_tools_enabled is \
+false in get_status) those tools aren't offered; if you need different setpoints, ask the \
+user to set them or to switch to Full Agent Controls. The tool list updates \
 when they do. Readings take a moment to settle after a change; call get_status again to \
 see them.
 
@@ -191,9 +253,9 @@ pub struct Report {
     pub limits: Option<DeviceLimits>,
     /// Live readings, read from the supply for this call.
     pub readings: Option<Readings>,
-    /// The app's "Agentic power configuration" switch. While false, set_voltage,
-    /// set_current and apply aren't offered; only the user can switch it on. Switching the
-    /// output is always available.
+    /// The switch under "MCP Settings" in the app: true = "Full Agent Controls", false =
+    /// "Output On/Off Controls Only". While false, set_voltage, set_current and apply aren't
+    /// offered; only the user can switch it. Switching the output is always available.
     pub setpoint_tools_enabled: bool,
 }
 
@@ -379,9 +441,9 @@ impl Bench {
         if !self.control.enabled() {
             (self.notify)(format!("Agent blocked: {what}"));
             return Err(format!(
-                "{what} refused: changing voltage and current needs \"Agentic power \
-                 configuration\" switched on in the SteadyState app. Ask the user to switch it \
-                 on or to set the values themselves. Output on/off is still available."
+                "{what} refused: changing voltage and current needs \"Full Agent Controls\", \
+                 switched on under MCP Settings in the SteadyState app. Ask the user to switch \
+                 it on or to set the values themselves. Output on/off is still available."
             ));
         }
         self.act(what, f).await
@@ -681,7 +743,7 @@ mod tests {
         let sink = notes.clone();
         let notify: Notify = Arc::new(move |n| sink.lock().unwrap().push(n));
         let control = AgentControl::default();
-        tokio::spawn(serve(listener, link, notify, control.clone()));
+        tokio::spawn(serve(listener, link, notify, control.clone(), CancellationToken::new()));
         let transport = StreamableHttpClientTransport::from_uri(url.clone());
         let client = TestClient::default().serve(transport).await.unwrap();
         Harness { url, notes, control, client }
@@ -821,7 +883,7 @@ mod tests {
             ("apply", json!({ "volts": 12.0, "amps": 1.0 })),
         ] {
             let err = error_text(&call(&h, tool, args).await);
-            assert!(err.contains("Agentic power configuration"), "{tool}: {err}");
+            assert!(err.contains("Full Agent Controls"), "{tool}: {err}");
         }
         let s = call(&h, "get_status", json!({})).await;
         assert_eq!(structured(&s)["readings"]["set_volts"], 5.0);
@@ -925,17 +987,75 @@ mod tests {
         assert!(!ok.contains(" 403"), "{ok}");
     }
 
-    #[test]
-    fn port_env_parsing() {
-        // SAFETY: only this test touches the variable.
-        unsafe { std::env::remove_var(PORT_ENV) };
-        assert_eq!(port_from_env(), Some(Ok(DEFAULT_PORT)));
-        unsafe { std::env::set_var(PORT_ENV, "off") };
-        assert_eq!(port_from_env(), None);
-        unsafe { std::env::set_var(PORT_ENV, "5000") };
-        assert_eq!(port_from_env(), Some(Ok(5000)));
-        unsafe { std::env::set_var(PORT_ENV, "0") };
-        assert!(matches!(port_from_env(), Some(Err(_))));
-        unsafe { std::env::remove_var(PORT_ENV) };
+    /// A port nothing listens on right now.
+    fn free_port() -> u16 {
+        bind(0).unwrap().local_addr().unwrap().port()
+    }
+
+    async fn connect(url: &str) -> Result<RunningService<RoleClient, TestClient>, String> {
+        let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+        TestClient::default().serve(transport).await.map_err(|e| e.to_string())
+    }
+
+    async fn reachable(port: u16) -> bool {
+        tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_moves_to_a_new_port() {
+        let link = Link::detached(Some(FakePsu::boxed()), connected());
+        let notify: Notify = Arc::new(|_| {});
+        let (a, b) = (free_port(), free_port());
+        let server = McpServer::start(link, notify, AgentControl::default(), a);
+        let url_a = format!("http://127.0.0.1:{a}/mcp");
+        assert_eq!(server.status(), McpStatus::Listening { url: url_a.clone(), port: a });
+        let old = connect(&url_a).await.unwrap();
+        assert_eq!(old.list_all_tools().await.unwrap().len(), 4);
+
+        // Same port again: nothing happens, the session survives.
+        server.set_port(a).unwrap();
+        assert_eq!(old.list_all_tools().await.unwrap().len(), 4);
+
+        let url_b = format!("http://127.0.0.1:{b}/mcp");
+        assert_eq!(server.set_port(b).unwrap(), McpStatus::Listening { url: url_b.clone(), port: b });
+        let new = connect(&url_b).await.unwrap();
+        assert_eq!(new.list_all_tools().await.unwrap().len(), 4);
+        // The old port is released and its session ended.
+        for _ in 0..100 {
+            if !reachable(a).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!reachable(a).await, "old port still open");
+        assert!(old.list_all_tools().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn taken_port_keeps_the_current_server() {
+        let link = Link::detached(None, connected());
+        let notify: Notify = Arc::new(|_| {});
+        let a = free_port();
+        let server = McpServer::start(link, notify, AgentControl::default(), a);
+        let taken = bind(0).unwrap();
+        let b = taken.local_addr().unwrap().port();
+
+        let err = server.set_port(b).unwrap_err();
+        assert!(err.contains(&format!("127.0.0.1:{b}")), "{err}");
+        assert!(matches!(server.status(), McpStatus::Listening { port, .. } if port == a));
+        assert!(connect(&format!("http://127.0.0.1:{a}/mcp")).await.is_ok());
+        assert!(server.set_port(0).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn taken_port_at_startup_is_reported_and_recoverable() {
+        let taken = bind(0).unwrap();
+        let b = taken.local_addr().unwrap().port();
+        let notify: Notify = Arc::new(|_| {});
+        let server = McpServer::start(Link::detached(None, connected()), notify, AgentControl::default(), b);
+        assert!(matches!(server.status(), McpStatus::Failed { port, .. } if port == b));
+        let a = free_port();
+        assert!(matches!(server.set_port(a).unwrap(), McpStatus::Listening { port, .. } if port == a));
+        assert!(connect(&format!("http://127.0.0.1:{a}/mcp")).await.is_ok());
     }
 }

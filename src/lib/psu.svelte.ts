@@ -29,11 +29,10 @@ export type LinkState =
 
 type Snapshot = { link: LinkState; status: Status | null }
 
-/** The MCP server agents connect to (src-tauri/src/mcp.rs). */
+/** The MCP server agents connect to (src-tauri/src/mcp.rs). `port` is the configured one. */
 export type McpStatus =
-  | { kind: 'disabled' }
-  | { kind: 'listening'; url: string }
-  | { kind: 'failed'; error: string }
+  | { kind: 'listening'; url: string; port: number }
+  | { kind: 'failed'; error: string; port: number }
 
 const ERROR_MS = 5000
 const AGENT_NOTE_MS = 6000
@@ -44,7 +43,7 @@ class Psu {
   error = $state<string | null>(null)
   /** The latest action an agent took over MCP, shown briefly in the footer. */
   agentNote = $state<string | null>(null)
-  mcp = $state<McpStatus>({ kind: 'disabled' })
+  mcp = $state<McpStatus | null>(null)
   /** "Agentic power configuration": may agents change setpoints and the output? */
   agentControl = $state(false)
 
@@ -91,6 +90,16 @@ class Psu {
   rescan = () => this.#run('rescan')
   pick = (d: Detected) => this.#run('pick_device', { port: d.port, driver: d.info.driver })
   dismissChoice = () => this.#run('dismiss_choice')
+
+  /** Moves the MCP server to `port`; returns the error, if any (the server then stays put). */
+  async setMcpPort(port: number): Promise<string | null> {
+    try {
+      this.mcp = await invoke<McpStatus>('set_mcp_port', { port })
+      return null
+    } catch (e) {
+      return String(e)
+    }
+  }
 
   async setAgentControl(on: boolean) {
     try {

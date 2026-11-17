@@ -1,11 +1,11 @@
 <script lang="ts">
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { onMount } from 'svelte'
-  import AgentSwitch from './lib/AgentSwitch.svelte'
   import Channel from './lib/Channel.svelte'
   import DevicePicker from './lib/DevicePicker.svelte'
   import LinkStatus from './lib/LinkStatus.svelte'
   import McpBadge from './lib/McpBadge.svelte'
+  import McpSettings from './lib/McpSettings.svelte'
   import OutputButton from './lib/OutputButton.svelte'
   import SetpointInput from './lib/SetpointInput.svelte'
   import { psu } from './lib/psu.svelte'
@@ -72,7 +72,7 @@
       <Channel label="Power" unit="W" color="watt" value={s?.p_meas ?? null} decimals={2} />
     </div>
     <OutputButton />
-    <AgentSwitch />
+    <McpSettings />
   </main>
 
   <footer>

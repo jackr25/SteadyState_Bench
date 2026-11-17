@@ -28,6 +28,7 @@ tauri-plugin-log = "2"
 rmcp = { version = "3.11.0", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["net", "time"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 rmcp = { version = "3.11.0", features = ["client", "transport-streamable-http-client-reqwest"] }

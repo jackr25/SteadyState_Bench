@@ -1,6 +1,6 @@
 # Driving the bench from an agent (MCP)
 
-While SteadyState is running, it serves an MCP server at:
+While SteadyState is running, it serves an MCP server at (default port):
 
 ```
 http://127.0.0.1:47310/mcp
@@ -9,10 +9,13 @@ http://127.0.0.1:47310/mcp
 The **MCP** badge in the app's footer shows the address; click it to copy. The badge turns
 blue while an agent is acting, and each action appears in the footer as it happens.
 
+Both settings below live in the **MCP Settings** tab under the Output button; click it to
+expand.
+
 ## Allowing changes: "Agentic power configuration"
 
-The app has an **Agentic power configuration** switch below the Output button. It is **off
-every time the app starts**. It only governs voltage and current: seeing the supply and
+The Off/On switch in MCP Settings is labeled by its state: **Output On/Off Controls Only**
+(off) or **Full Agent Controls** (on). It is **off every time the app starts**. It only governs voltage and current: seeing the supply and
 switching its output are always available, so an agent can power the device under test on,
 off or through a reset as part of a larger task.
 
@@ -84,13 +87,17 @@ Out-of-range values are refused as tool errors without touching the supply.
   loopback `Host` names, and refuses any request carrying a browser `Origin` header (so
   browser-based tools such as the MCP Inspector web UI are refused too).
 
-## Settings
+## Changing the port
 
-| `STEADYSTATE_MCP_PORT` | Effect |
-|---|---|
-| unset | Listen on 47310 |
-| a port number | Listen on that port |
-| `off` | No MCP server |
+Edit the port under **Address** in MCP Settings and press Apply (or Enter). The server moves
+right away: the new port is opened first, then the old one is closed, which ends sessions on
+it, so point your agents at the new address. The port is saved and used on the next launch
+too.
 
-If the port is taken (for example by a second instance), the app runs normally and the badge
-shows the error, struck through.
+If the new port is taken, nothing changes: the server keeps running where it was and the
+error is shown under the field. If the saved port is taken at startup (for example by a
+second instance), the app runs normally, the badge shows the error struck through, and you
+can pick another port.
+
+The host is always `127.0.0.1` and can't be changed: listening on another address would let
+other machines on the network control the supply.

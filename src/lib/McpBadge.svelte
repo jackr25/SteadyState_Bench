@@ -6,15 +6,15 @@
   let copied = $state(false)
 
   const title = $derived(
-    mcp.kind === 'listening'
+    mcp?.kind === 'listening'
       ? `Agents can control this supply over MCP at ${mcp.url} (click to copy)`
-      : mcp.kind === 'failed'
+      : mcp?.kind === 'failed'
         ? `MCP server not running: ${mcp.error}`
         : '',
   )
 
   async function copy() {
-    if (mcp.kind !== 'listening') return
+    if (mcp?.kind !== 'listening') return
     try {
       await navigator.clipboard.writeText(mcp.url)
       copied = true
@@ -25,7 +25,7 @@
   }
 </script>
 
-{#if mcp.kind !== 'disabled'}
+{#if mcp}
   <button class="mcp {mcp.kind}" class:active={psu.agentNote !== null} onclick={copy} {title} aria-label={title}>
     {copied ? 'copied' : 'MCP'}
   </button>

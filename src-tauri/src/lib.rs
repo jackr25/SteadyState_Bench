@@ -2,10 +2,12 @@ mod link;
 mod mcp;
 mod persist;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use link::{Link, Snapshot};
-use mcp::{AgentControl, McpStatus};
+use mcp::{AgentControl, McpServer, McpStatus};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Agent actions, shown in the footer so the person at the bench sees them.
@@ -16,9 +18,31 @@ fn snapshot(link: State<'_, Link>) -> Snapshot {
     link.snapshot()
 }
 
+/// MCP settings kept between sessions. The agent-control switch is deliberately not saved:
+/// it starts off every launch.
+#[derive(Serialize, Deserialize)]
+struct McpSettings {
+    port: u16,
+}
+
+struct Mcp {
+    server: McpServer,
+    settings_path: PathBuf,
+}
+
 #[tauri::command]
-fn mcp_info(status: State<'_, McpStatus>) -> McpStatus {
-    status.inner().clone()
+fn mcp_info(mcp: State<'_, Mcp>) -> McpStatus {
+    mcp.server.status()
+}
+
+/// Moves the MCP server to `port` and remembers it. On error the server stays where it was.
+#[tauri::command]
+fn set_mcp_port(mcp: State<'_, Mcp>, port: u16) -> Result<McpStatus, String> {
+    let status = mcp.server.set_port(port)?;
+    if let Err(e) = persist::save(&mcp.settings_path, &McpSettings { port }) {
+        log::warn!("can't save {}: {e}", mcp.settings_path.display());
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -75,10 +99,12 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            let last_device = app.path().app_config_dir()?.join("last_device.json");
-            let link = Link::start(app.handle().clone(), last_device);
+            let config_dir = app.path().app_config_dir()?;
+            let link = Link::start(app.handle().clone(), config_dir.join("last_device.json"));
             let control = AgentControl::default();
-            app.manage(start_mcp(app.handle(), link.clone(), control.clone()));
+            let settings_path = config_dir.join("mcp.json");
+            let server = start_mcp(app.handle(), link.clone(), control.clone(), &settings_path);
+            app.manage(Mcp { server, settings_path });
             app.manage(control);
             app.manage(link);
             Ok(())
@@ -86,6 +112,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             snapshot,
             mcp_info,
+            set_mcp_port,
             agent_control,
             set_agent_control,
             rescan,
@@ -99,34 +126,18 @@ pub fn run() {
         .expect("error while building tauri application");
 }
 
-/// Starts the MCP server for agents unless disabled; never fails app startup.
-fn start_mcp(app: &AppHandle, link: Link, control: AgentControl) -> McpStatus {
-    let port = match mcp::port_from_env() {
-        None => return McpStatus::Disabled,
-        Some(Err(error)) => return McpStatus::Failed { error },
-        Some(Ok(port)) => port,
-    };
-    let listener = match mcp::bind(port) {
-        Ok(l) => l,
-        Err(e) => {
-            log::warn!("MCP server not started: {e}");
-            let error = format!("can't listen on 127.0.0.1:{port}: {e}");
-            return McpStatus::Failed { error };
-        }
-    };
-    let url = match listener.local_addr() {
-        Ok(addr) => mcp::url(addr),
-        Err(e) => return McpStatus::Failed { error: e.to_string() },
-    };
+/// Starts the MCP server for agents on the saved port; never fails app startup.
+fn start_mcp(
+    app: &AppHandle,
+    link: Link,
+    control: AgentControl,
+    settings_path: &std::path::Path,
+) -> McpServer {
+    let port = persist::load::<McpSettings>(settings_path).map_or(mcp::DEFAULT_PORT, |s| s.port);
     let emitter = app.clone();
     let notify: mcp::Notify = Arc::new(move |note| {
         log::info!("{note}");
         let _ = emitter.emit(EVENT_AGENT, note);
     });
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = mcp::serve(listener, link, notify, control).await {
-            log::error!("MCP server stopped: {e}");
-        }
-    });
-    McpStatus::Listening { url }
+    McpServer::start(link, notify, control, port)
 }
