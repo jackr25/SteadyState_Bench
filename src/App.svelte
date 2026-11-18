@@ -4,6 +4,8 @@
   import Channel from './lib/Channel.svelte'
   import DevicePicker from './lib/DevicePicker.svelte'
   import LinkStatus from './lib/LinkStatus.svelte'
+  import McpBadge from './lib/McpBadge.svelte'
+  import McpSettings from './lib/McpSettings.svelte'
   import OutputButton from './lib/OutputButton.svelte'
   import SetpointInput from './lib/SetpointInput.svelte'
   import { psu } from './lib/psu.svelte'
@@ -70,15 +72,19 @@
       <Channel label="Power" unit="W" color="watt" value={s?.p_meas ?? null} decimals={2} />
     </div>
     <OutputButton />
+    <McpSettings />
   </main>
 
   <footer>
     {#if psu.error}
       <span class="error" title={psu.error}>{psu.error}</span>
+    {:else if psu.agentNote}
+      <span class="agent" title={psu.agentNote}>{psu.agentNote}</span>
     {:else}
       <LinkStatus />
     {/if}
     <div class="tools">
+      <McpBadge />
       <button class="icon" onclick={cycleTheme} title="Theme: {theme.value}" aria-label="Theme: {theme.value}">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
           {#if theme.value === 'light'}
@@ -149,12 +155,16 @@
     flex: 1;
     min-width: 0;
   }
-  .error {
+  .error,
+  .agent {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 11px;
     color: var(--danger);
+  }
+  .agent {
+    color: var(--focus);
   }
   .tools {
     display: flex;

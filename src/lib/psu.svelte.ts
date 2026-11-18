@@ -29,14 +29,26 @@ export type LinkState =
 
 type Snapshot = { link: LinkState; status: Status | null }
 
+/** The MCP server agents connect to (src-tauri/src/mcp.rs). `port` is the configured one. */
+export type McpStatus =
+  | { kind: 'listening'; url: string; port: number }
+  | { kind: 'failed'; error: string; port: number }
+
 const ERROR_MS = 5000
+const AGENT_NOTE_MS = 6000
 
 class Psu {
   link = $state<LinkState>({ kind: 'searching', last: null })
   status = $state<Status | null>(null)
   error = $state<string | null>(null)
+  /** The latest action an agent took over MCP, shown briefly in the footer. */
+  agentNote = $state<string | null>(null)
+  mcp = $state<McpStatus | null>(null)
+  /** "Agentic power configuration": may agents change setpoints and the output? */
+  agentControl = $state(false)
 
   #errorTimer: ReturnType<typeof setTimeout> | undefined
+  #agentTimer: ReturnType<typeof setTimeout> | undefined
 
   get connected() {
     return this.link.kind === 'connected'
@@ -60,6 +72,13 @@ class Psu {
       sawStatus = true
       this.status = e.payload
     })
+    await listen<string>('psu://agent', (e) => {
+      this.agentNote = e.payload
+      clearTimeout(this.#agentTimer)
+      this.#agentTimer = setTimeout(() => (this.agentNote = null), AGENT_NOTE_MS)
+    })
+    this.mcp = await invoke<McpStatus>('mcp_info')
+    this.agentControl = await invoke<boolean>('agent_control')
     const snap = await invoke<Snapshot>('snapshot')
     if (!sawLink) this.link = snap.link
     if (!sawStatus) this.status = snap.status
@@ -72,16 +91,38 @@ class Psu {
   pick = (d: Detected) => this.#run('pick_device', { port: d.port, driver: d.info.driver })
   dismissChoice = () => this.#run('dismiss_choice')
 
+  /** Moves the MCP server to `port`; returns the error, if any (the server then stays put). */
+  async setMcpPort(port: number): Promise<string | null> {
+    try {
+      this.mcp = await invoke<McpStatus>('set_mcp_port', { port })
+      return null
+    } catch (e) {
+      return String(e)
+    }
+  }
+
+  async setAgentControl(on: boolean) {
+    try {
+      this.agentControl = await invoke<boolean>('set_agent_control', { on })
+    } catch (e) {
+      this.#fail(e)
+    }
+  }
+
   async #run(cmd: string, args?: Record<string, unknown>): Promise<boolean> {
     try {
       await invoke(cmd, args)
       return true
     } catch (e) {
-      this.error = String(e)
-      clearTimeout(this.#errorTimer)
-      this.#errorTimer = setTimeout(() => (this.error = null), ERROR_MS)
+      this.#fail(e)
       return false
     }
+  }
+
+  #fail(e: unknown) {
+    this.error = String(e)
+    clearTimeout(this.#errorTimer)
+    this.#errorTimer = setTimeout(() => (this.error = null), ERROR_MS)
   }
 }
 
