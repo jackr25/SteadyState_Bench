@@ -47,7 +47,7 @@ jobs:
       - name: Checks
         run: |
           npm run check
-          cargo test -p steady_state_bench
+          cargo test -p steady_state_bench -p app
       - run: npm run tauri build -- --bundles ${{ matrix.bundles }}
 
       - uses: actions/upload-artifact@v4

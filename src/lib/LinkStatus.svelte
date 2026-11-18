@@ -3,13 +3,18 @@
 
   const link = $derived(psu.link)
   // While searching or disconnected, show the device we expect so startup isn't blank.
-  const device = $derived(link.kind === 'connected' ? link.device : link.last)
+  // While choosing, the picker dialog has the details.
+  const device = $derived(
+    link.kind === 'connected' ? link.device : link.kind === 'choosing' ? null : link.last,
+  )
   const title = $derived(
     link.kind === 'connected'
       ? `${link.device.model} on ${link.device.port} (${link.device.driver})`
       : link.kind === 'searching'
         ? 'Looking for a supported supply…'
-        : link.reason,
+        : link.kind === 'choosing'
+          ? 'Choose a supply to connect to'
+          : link.reason,
   )
 </script>
 
@@ -21,6 +26,10 @@
   {/if}
   {#if link.kind === 'searching'}
     <span class="note">{device ? 'connecting…' : 'searching…'}</span>
+  {:else if link.kind === 'choosing'}
+    <span class="note">
+      {link.found.length === 1 ? 'new supply found' : `${link.found.length} supplies found`}
+    </span>
   {:else if link.kind === 'disconnected'}
     <span class="note">{device ? 'offline' : link.reason}</span>
     <button class="rescan" onclick={psu.rescan}>rescan</button>
@@ -48,6 +57,9 @@
   .searching .dot {
     background: var(--warn);
     animation: pulse 1.2s ease-in-out infinite;
+  }
+  .choosing .dot {
+    background: var(--warn);
   }
   .disconnected .dot {
     background: transparent;

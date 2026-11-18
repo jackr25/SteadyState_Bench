@@ -21,6 +21,11 @@ pub enum Error {
     OutOfRange { quantity: &'static str, value: f64, max: f64 },
     #[error("{0} is not supported by this device")]
     Unsupported(&'static str),
+    /// For protocols without their own error type (Korad text protocol).
+    #[error("no response from device (timeout)")]
+    Timeout,
+    #[error("unexpected response: {0}")]
+    Unexpected(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

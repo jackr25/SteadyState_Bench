@@ -2,6 +2,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { onMount } from 'svelte'
   import Channel from './lib/Channel.svelte'
+  import DevicePicker from './lib/DevicePicker.svelte'
   import LinkStatus from './lib/LinkStatus.svelte'
   import OutputButton from './lib/OutputButton.svelte'
   import SetpointInput from './lib/SetpointInput.svelte'
@@ -40,7 +41,8 @@
 
 <svelte:window {onkeydown} />
 
-<div class="app">
+<!-- inert while the picker is open, so focus and clicks stay in the dialog -->
+<div class="app" inert={psu.link.kind === 'choosing'}>
   <main>
     <div class="channels">
       <Channel label="Voltage" unit="V" color="volt" value={s?.v_meas ?? null} decimals={2}>
@@ -111,6 +113,8 @@
     </div>
   </footer>
 </div>
+
+<DevicePicker />
 
 <style>
   .app {

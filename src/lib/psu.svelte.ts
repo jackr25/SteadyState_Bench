@@ -7,6 +7,8 @@ import { listen } from '@tauri-apps/api/event'
 
 export type KnownDevice = { port: string; driver: string; model: string }
 export type Limits = { voltage: number; current: number; power: number }
+/** A supply found by a scan (Rust `psu_core::drivers::Detected`). */
+export type Detected = { port: string; info: { driver: string; model: string; limits: Limits } }
 
 export type Status = {
   output_on: boolean
@@ -22,6 +24,7 @@ export type Status = {
 export type LinkState =
   | { kind: 'searching'; last: KnownDevice | null }
   | { kind: 'connected'; device: KnownDevice; limits: Limits }
+  | { kind: 'choosing'; found: Detected[]; suggested: number; last: KnownDevice | null }
   | { kind: 'disconnected'; last: KnownDevice | null; reason: string }
 
 type Snapshot = { link: LinkState; status: Status | null }
@@ -66,6 +69,8 @@ class Psu {
   setCurrent = (amps: number) => this.#run('set_current', { amps })
   setOutput = (on: boolean) => this.#run('set_output', { on })
   rescan = () => this.#run('rescan')
+  pick = (d: Detected) => this.#run('pick_device', { port: d.port, driver: d.info.driver })
+  dismissChoice = () => this.#run('dismiss_choice')
 
   async #run(cmd: string, args?: Record<string, unknown>): Promise<boolean> {
     try {

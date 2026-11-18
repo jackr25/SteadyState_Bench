@@ -18,11 +18,21 @@ pub struct SerialTransport(Box<dyn SerialPort>);
 
 /// Opens `path` as 8N1 at `baud`.
 pub fn open(path: &str, baud: u32) -> serialport::Result<SerialTransport> {
+    open_with_timeout(path, baud, READ_TIMEOUT)
+}
+
+/// Like [`open`], with a custom per-read timeout. For protocols without reply terminators
+/// (Korad), which detect the end of a reply by a short idle gap.
+pub fn open_with_timeout(
+    path: &str,
+    baud: u32,
+    timeout: Duration,
+) -> serialport::Result<SerialTransport> {
     let port = serialport::new(path, baud)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
-        .timeout(READ_TIMEOUT)
+        .timeout(timeout)
         .open()?;
     // The CH340 bridge drops a request sent immediately after the port opens.
     thread::sleep(OPEN_SETTLE);
